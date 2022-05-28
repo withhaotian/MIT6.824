@@ -24,8 +24,10 @@ import (
 
 //	"6.824/labgob"
 	"6.824/labrpc"
-)
 
+	"time"
+	"math/rand"
+)
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -50,6 +52,14 @@ type ApplyMsg struct {
 	SnapshotIndex int
 }
 
+// 宏定义-节点状态（跟随者、候选人、领导者）
+type NodeState int
+const (
+	Follower    NodeState = 0
+	Candidate	NodeState = 1
+	Leader   	NodeState = 2
+)
+
 //
 // A Go object implementing a single Raft peer.
 //
@@ -63,7 +73,27 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
+	
+	// 参考Fig.2
+	// 定义raft数据结构
+	state			NodeState			// 节点状态
+	currentTerm 	int					// 最新的任期数
+	votedFor		int					// 在当前任期投票给的候选人ID
 
+	// 选举时间
+	electionTime time.Time
+}
+
+// 选举定时器随机值设为150-300ms
+func RandomizedElectionTimeout() time.time {
+	// 定义随机种子
+	rand.Seed(time.Now().UnixNano())
+	msec_base := rand.Intn(300) + 150
+
+	t := time.Now()
+	t = t.Add(time.Duration(msec_base) * time.Millisecond)
+	
+	return t
 }
 
 // return currentTerm and whether this server
@@ -73,6 +103,13 @@ func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
 	// Your code here (2A).
+	// 返回当前rf节点的任期数和是否为leader
+	term = rf.currentTerm
+	if rf.state == Leader {
+		isleader = true
+	} else {
+		isleader = false
+	}
 	return term, isleader
 }
 
@@ -136,13 +173,14 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 }
 
-
 //
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+	term			int 	// 候选人的任期数
+	candidateId		int		// 请求vote的候选人id
 }
 
 //
@@ -151,6 +189,17 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
+	term			int 	// currentTerm，对于候选人而言更新自己的term
+	VoteGranted		bool 	// true意味着候选人已经收到了选票
+}
+
+type AppendEntriesArgs struct {
+	term 		int		// leader的任期数
+	LeaderId	int		// leader的ID
+}
+
+type AppendEntriesReply struct {
+	term 		int 	// currentTerm，对于领导者而言更新自己的term
 }
 
 //
@@ -158,6 +207,94 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	
+
+}
+
+//
+// example AppendEntry RPC handler.
+//
+func (rf *Raft) AppendEntry(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	// Your code here (2A, 2B).
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	
+}
+
+// 只有成为leader才会发送appendEntries
+func (rf *Raft) sendAppendEntries(heartBeat bool) {
+	args := AppendEntriesArgs{rf.currentTerm, rf.me}
+
+	DPrintf("{Leader %v} sends AppendEntriesArgs %v", rf.me, args)
+
+	for i:= range rf.peers {
+		if i != rf.me {
+			go function {
+				reply := AppendEntriesReply{}
+				ok := sendAppendEntry(rf.me, &args, &reply)
+
+				if ok {
+					rf.mu.Lock()
+					defer rf.mu.Unlock()
+
+					if reply.term > rf.currentTerm {
+						rf.currentTerm = reply.term
+						rf.state = Follower
+						rf.votedFor = -1
+					}
+				}
+			}
+		}
+	}
+}
+
+func (rf *Raft) startElection() {
+	// 开始选举时，首先将自身变为candidate，并且让任期数+1
+	rf.state = Candidate
+	rf.currentTerm += 1
+	rf.votedFor = rf.me		// 每个候选人在发起选举后，投票给自己
+
+	votes := 1
+
+	args := RequestVoteArgs{rf.currentTerm, rf.me}
+	DPrintf("{Node %v} starts election with RequestVoteArgs %v", rf.me, args)
+
+	for i := range rf.peers {
+		if i != rf.me {
+			// 异步并行投票，不阻塞
+			go function {
+				reply := RequestVoteReply{}
+				ok := sendRequestVote(rf.me, &args, &reply)
+
+				if ok {
+					rf.mu.Lock()
+					defer rf.mu.Unlock()
+					
+					// 候选人收到了选票
+					if reply.VoteGranted {
+						votes += 1
+						// 获得超过半数的选票，则变为Leader
+						if votes == len(rf.peers)/2 + 1 {
+							rf.state = Leader
+							rf.sendAppendEntries(true)	// 发送心跳包
+							rf.electionTime = RandomizedElectionTimeout()	// 更新选举时间
+						}
+					}
+					// IF RPC request or response contains term T > currentterm:
+					else if reply.term > rf.currentTerm {
+						rf.currentTerm = reply.term
+						rf.state = Follower
+						rf.votedFor = -1
+					}
+				}
+			}
+		}
+	}
 }
 
 //
@@ -194,6 +331,10 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
+func (rf *Raft) sendAppendEntry(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntry", args, reply)
+	return ok
+}
 
 //
 // the service using Raft (e.g. a k/v server) wants to start
@@ -249,7 +390,22 @@ func (rf *Raft) ticker() {
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using
 		// time.Sleep().
+		rf.mu.Lock()
+		// 如果状态为leader，则需要定期发布心跳包
+		if rf.state == Leader {
+			rf.electionTime = RandomizedElectionTimeout()
+			// 已经有leader，发送心跳包给其他节点
+			rf.sendAppendEntries(true)
+		}
 
+		// 如果选举时间超时了，则自动进入下一轮选举
+		if time.Now().After(rf.electionTime) {
+			rf.electionTime = RandomizedElectionTimeout()
+			// 开始选举 
+			rf.startElection()
+		}
+
+		rf.mu.Unlock();
 	}
 }
 
@@ -272,6 +428,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+	rf.state = Follower
+	rf.currentTerm = 0
+	rf.votedFor = -1
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
