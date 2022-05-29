@@ -85,7 +85,7 @@ type Raft struct {
 }
 
 // 选举定时器随机值设为150-300ms
-func RandomizedElectionTimeout() time.time {
+func RandomizedElectionTimeout() time.Time {
 	// 定义随机种子
 	rand.Seed(time.Now().UnixNano())
 	msec_base := rand.Intn(300) + 150
@@ -99,11 +99,13 @@ func RandomizedElectionTimeout() time.time {
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
 	var term int
 	var isleader bool
 	// Your code here (2A).
 	// 返回当前rf节点的任期数和是否为leader
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	
 	term = rf.currentTerm
 	if rf.state == Leader {
 		isleader = true
@@ -179,8 +181,8 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
-	term			int 	// 候选人的任期数
-	candidateId		int		// 请求vote的候选人id
+	Term			int 	// 候选人的任期数
+	CandidateId		int		// 请求vote的候选人id
 }
 
 //
@@ -189,17 +191,17 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
-	term			int 	// currentTerm，对于候选人而言更新自己的term
+	Term			int 	// currentTerm，对于候选人而言更新自己的term
 	VoteGranted		bool 	// true意味着候选人已经收到了选票
 }
 
 type AppendEntriesArgs struct {
-	term 		int		// leader的任期数
+	Term 		int		// leader的任期数
 	LeaderId	int		// leader的ID
 }
 
 type AppendEntriesReply struct {
-	term 		int 	// currentTerm，对于领导者而言更新自己的term
+	Term 		int 	// currentTerm，对于领导者而言更新自己的term
 }
 
 //
@@ -211,8 +213,25 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	
+	// 如果来自其他节点的投票请求的任期小于当前节点，则视为无效
+	// 或者当前节点已经给其他节点投过票
+	if args.Term < rf.currentTerm || (args.Term == rf.currentTerm && rf.votedFor != -1 && rf.votedFor != args.CandidateId) {
+		reply.Term = rf.currentTerm
+		reply.VoteGranted = false
+		return
+	}
 
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		rf.state = Follower
+	}
+	
+	rf.votedFor = args.CandidateId
+	
+	reply.Term = rf.currentTerm
+	reply.VoteGranted = true
+
+	rf.electionTime = RandomizedElectionTimeout()
 }
 
 //
@@ -223,78 +242,27 @@ func (rf *Raft) AppendEntry(args *AppendEntriesArgs, reply *AppendEntriesReply) 
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+
+	// 如果来自其他节点的投票请求的任期小于当前节点，则视为无效
+	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
+		return
+	}
+
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		rf.state = Follower
+	}
 	
-}
-
-// 只有成为leader才会发送appendEntries
-func (rf *Raft) sendAppendEntries(heartBeat bool) {
-	args := AppendEntriesArgs{rf.currentTerm, rf.me}
-
-	DPrintf("{Leader %v} sends AppendEntriesArgs %v", rf.me, args)
-
-	for i:= range rf.peers {
-		if i != rf.me {
-			go function {
-				reply := AppendEntriesReply{}
-				ok := sendAppendEntry(rf.me, &args, &reply)
-
-				if ok {
-					rf.mu.Lock()
-					defer rf.mu.Unlock()
-
-					if reply.term > rf.currentTerm {
-						rf.currentTerm = reply.term
-						rf.state = Follower
-						rf.votedFor = -1
-					}
-				}
-			}
-		}
+	// 候选人收到了来自leader的心跳包，会转为follower
+	if rf.state == Candidate {
+		rf.state = Follower
+		rf.votedFor = -1
 	}
-}
+	
+	reply.Term = args.Term
 
-func (rf *Raft) startElection() {
-	// 开始选举时，首先将自身变为candidate，并且让任期数+1
-	rf.state = Candidate
-	rf.currentTerm += 1
-	rf.votedFor = rf.me		// 每个候选人在发起选举后，投票给自己
-
-	votes := 1
-
-	args := RequestVoteArgs{rf.currentTerm, rf.me}
-	DPrintf("{Node %v} starts election with RequestVoteArgs %v", rf.me, args)
-
-	for i := range rf.peers {
-		if i != rf.me {
-			// 异步并行投票，不阻塞
-			go function {
-				reply := RequestVoteReply{}
-				ok := sendRequestVote(rf.me, &args, &reply)
-
-				if ok {
-					rf.mu.Lock()
-					defer rf.mu.Unlock()
-					
-					// 候选人收到了选票
-					if reply.VoteGranted {
-						votes += 1
-						// 获得超过半数的选票，则变为Leader
-						if votes == len(rf.peers)/2 + 1 {
-							rf.state = Leader
-							rf.sendAppendEntries(true)	// 发送心跳包
-							rf.electionTime = RandomizedElectionTimeout()	// 更新选举时间
-						}
-					}
-					// IF RPC request or response contains term T > currentterm:
-					else if reply.term > rf.currentTerm {
-						rf.currentTerm = reply.term
-						rf.state = Follower
-						rf.votedFor = -1
-					}
-				}
-			}
-		}
-	}
+	rf.electionTime = RandomizedElectionTimeout()
 }
 
 //
@@ -334,6 +302,77 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 func (rf *Raft) sendAppendEntry(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntry", args, reply)
 	return ok
+}
+
+// 只有成为leader才会发送appendEntries
+func (rf *Raft) sendAppendEntries(heartBeat bool) {
+	args := AppendEntriesArgs{rf.currentTerm, rf.me}
+
+	DPrintf("{Leader %v} sends AppendEntriesArgs %v", rf.me, args)
+
+	for i:= range rf.peers {
+		if i != rf.me {
+			go func(i int) {
+				reply := AppendEntriesReply{}
+				ok := rf.sendAppendEntry(i, &args, &reply)
+
+				if ok {
+					rf.mu.Lock()
+					defer rf.mu.Unlock()
+
+					if reply.Term > rf.currentTerm {
+						rf.currentTerm = reply.Term
+						rf.state = Follower
+						rf.votedFor = -1
+					}
+				}
+			}(i)
+		}
+	}
+}
+
+func (rf *Raft) startElection() {
+	// 开始选举时，首先将自身变为candidate，并且让任期数+1
+	rf.state = Candidate
+	rf.currentTerm += 1
+	rf.votedFor = rf.me		// 每个候选人在发起选举后，投票给自己
+
+	votes := 1
+
+	args := RequestVoteArgs{rf.currentTerm, rf.me}
+	DPrintf("{Node %v} starts election with RequestVoteArgs %v", rf.me, args)
+
+	for i := range rf.peers {
+		if i != rf.me {
+			// 异步并行投票，不阻塞
+			go func(i int) {
+				reply := RequestVoteReply{}
+				ok := rf.sendRequestVote(i, &args, &reply)
+
+				if ok {
+					rf.mu.Lock()
+					defer rf.mu.Unlock()
+
+					DPrintf("{Node %v} receives RequestVoteReply %v from {Node %v} after sending RequestVoteArgs %v in term %v", rf.me, reply, i, args, rf.currentTerm)
+					
+					// 候选人收到了选票
+					if reply.VoteGranted {
+						votes += 1
+						// 获得超过半数的选票，则变为Leader
+						if votes > len(rf.peers)/2 {
+							rf.state = Leader
+							rf.sendAppendEntries(true)	// 发送心跳包
+							rf.electionTime = RandomizedElectionTimeout()	// 更新选举时间
+						}
+					} else if reply.Term > rf.currentTerm { // IF RPC request or response contains term T > currentterm: 
+						rf.currentTerm = reply.Term
+						rf.state = Follower
+						rf.votedFor = -1
+					}
+				}
+			}(i)
+		}
+	}
 }
 
 //
@@ -396,16 +435,15 @@ func (rf *Raft) ticker() {
 			rf.electionTime = RandomizedElectionTimeout()
 			// 已经有leader，发送心跳包给其他节点
 			rf.sendAppendEntries(true)
-		}
-
-		// 如果选举时间超时了，则自动进入下一轮选举
-		if time.Now().After(rf.electionTime) {
+		} else if time.Now().After(rf.electionTime) { // 如果选举时间超时了，则自动进入下一轮选举
 			rf.electionTime = RandomizedElectionTimeout()
 			// 开始选举 
 			rf.startElection()
 		}
-
 		rf.mu.Unlock();
+
+		ms := 50
+		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 }
 
@@ -431,6 +469,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.state = Follower
 	rf.currentTerm = 0
 	rf.votedFor = -1
+	rf.electionTime = RandomizedElectionTimeout()
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
